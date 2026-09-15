@@ -18,14 +18,21 @@
         exit(EXIT_FAILURE);                           \
     }
 
-void OpenCLOpticalFlow(Matrix *input0, Matrix *result)
+void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
 {
     // Load external OpenCL kernel code
     char *kernel_source = OclLoadKernel("opticalFlow.cl"); // Load kernel source
 
-    // Device input and output buffers
-    // frame 1, output for now
-    cl_mem device_a, device_c;
+    // Device input and output buffers (float, 0 to 1.0f)
+    // device_a0 = frame 1 level 0 (no downsample)
+    // device_b0 = frame 2 
+    // device_a1 = frame 1 level 1 (downsampled with gaussian blur 1/2)
+    // device_b1 = frame 2 
+    // device_a2 = frame 1 level 2 (downsampled with gaussian blur 1/4)
+    // device_b2 = frame 2
+    // device_
+    // device_c = output (float, 0 to 1.0f)
+    cl_mem device_a0, device_b0, device_a1, device_b1, device_a2, device_b2, device_c;
 
     cl_int err;
 
@@ -33,11 +40,18 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *result)
     cl_context context;        // context
     cl_command_queue queue;    // command queue
     cl_program program;        // program
-    cl_kernel kernel;          // kernel
+    cl_kernel downsample_kernel;          // kernel
+    cl_kernel gradient_kernel;          // kernel
+    cl_kernel solver_kernel;          // kernel
 
     // Find platforms and devices
     OclPlatformProp *platforms = NULL;
     cl_uint num_platforms;
+
+    //@@ define local and global work sizes
+    size_t local_item_size[2] = {16, 16};
+    size_t global_item_size[2];
+
 
     err = OclFindPlatforms((const OclPlatformProp **)&platforms, &num_platforms);
     CHECK_ERR(err, "OclFindPlatforms");
@@ -67,59 +81,154 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *result)
     CHECK_ERR(err, "clBuildProgram");
 
     // Create the compute kernel in the program we wish to run
-    kernel = clCreateKernel(program, "opticalFlow", &err);
+    downsample_kernel = clCreateKernel(program, "lk_downsample", &err);
     CHECK_ERR(err, "clCreateKernel");
 
-    //@@ Allocate GPU memory here
-    device_a = clCreateBuffer(context, CL_MEM_READ_ONLY, (*input0).shape[0] * (*input0).shape[1] * sizeof(unsigned int), NULL, &err);
-    CHECK_ERR(err, "clCreateBuffer1");
-    device_c = clCreateBuffer(context, CL_MEM_READ_ONLY, (*result).shape[0] * (*result).shape[1] * sizeof(unsigned int), NULL, &err);
-    CHECK_ERR(err, "clCreateBuffer3");
+    printf("Kernels created\n");
+    
+    // Allocate GPU here
+    // Pyramid layer 0
+    int height_0 = input0->shape[0];
+    int width_0 = input0->shape[1];
+    device_a0 = clCreateBuffer(context, CL_MEM_READ_ONLY, height_0 * width_0 * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+    device_b0 = clCreateBuffer(context, CL_MEM_READ_ONLY, height_0 * width_0 * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+
+    // Pyramid layer 1
+    int height_1 = (height_0 + 1) / 2;
+    int width_1 = (width_0 + 1) / 2;
+    device_a1 = clCreateBuffer(context, CL_MEM_READ_ONLY, height_1 * width_1 * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+    device_b1 = clCreateBuffer(context, CL_MEM_READ_ONLY, height_1 * width_1 * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+
+    // Pyramid layer 2
+    int height_2 = (height_1 + 1) / 2;
+    int width_2 = (width_1 + 1) / 2;
+    device_a2 = clCreateBuffer(context, CL_MEM_READ_ONLY, height_2 * width_2 * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+    device_b2 = clCreateBuffer(context, CL_MEM_READ_ONLY, height_2 * width_2 * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+
+    // Output
+    device_c = clCreateBuffer(context, CL_MEM_READ_ONLY, height_0 * width_0 * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
 
 
-    //@@ Copy memory to the GPU here
-    err = clEnqueueWriteBuffer(queue, device_a, CL_TRUE, 0, (*input0).shape[0] * (*input0).shape[1] * sizeof(unsigned int), (*input0).data, 0, NULL, NULL);
-    CHECK_ERR(err, "clEnqueueWriteBuffer1");
 
 
-    //@@ define local and global work sizes
-    unsigned int size_a = (*input0).shape[0] * (*input0).shape[1];
-    size_t local_item_size[2] = {16, 16};
-    //err = clGetDeviceInfo(*device_id, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &local_item_size, NULL);
-    size_t global_item_size[2];
+    // ------------------------- DOWNSAMPLE LAYER 1 ------------------------ //
+    printf("Downsample Layer 1...\n");
+    global_item_size[0] = ((width_1 + local_item_size[0] - 1) / local_item_size[0]) * local_item_size[0];
+    global_item_size[1] = ((height_1 + local_item_size[1] - 1) / local_item_size[1]) * local_item_size[1];
 
-    // across rows first, col second
-    global_item_size[0] = ((input0->shape[1] + local_item_size[0] - 1) / local_item_size[0]) * local_item_size[0];
-    global_item_size[1] = ((input0->shape[0] + local_item_size[1] - 1) / local_item_size[1]) * local_item_size[1];
+    // Write to GPU
+    err = clEnqueueWriteBuffer(queue, device_a0, CL_TRUE, 0, height_0 * width_0 * sizeof(float), input0->data, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueWriteBuffer");
 
+    // Kernel arguments
 
+    //__global const float* src, __global float* dst, const int src_width, 
+    // const int src_height, const int dst_width, const int dst_height
+    err = clSetKernelArg(downsample_kernel, 0, sizeof(cl_mem), &device_a0);
+    CHECK_ERR(err, "clSetKernelArg");
+    err = clSetKernelArg(downsample_kernel, 1, sizeof(cl_mem), &device_a1);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(downsample_kernel, 2, sizeof(int), &width_0);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(downsample_kernel, 3, sizeof(int), &height_0);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(downsample_kernel, 4, sizeof(int), &width_1);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(downsample_kernel, 5, sizeof(int), &height_1);
+    CHECK_ERR(err, "clSetKernelArg");
 
-
-    // Set the arguments to our compute kernel
-    // __global const int *A, __global const int *B, __global int *C,
-    // const unsigned int numARows, const unsigned int numAColumns,
-
-    err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &device_a);
-    CHECK_ERR(err, "clSetKernelArg 0");
-    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &device_c);
-    CHECK_ERR(err, "clSetKernelArg 2");
-    err |= clSetKernelArg(kernel, 2, sizeof(int), &input0->shape[0]);
-    CHECK_ERR(err, "clSetKernelArg 3");
-    err |= clSetKernelArg(kernel, 3, sizeof(int), &input0->shape[1]);
-
-    //@@ Launch the GPU Kernel here
-    err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global_item_size, local_item_size, 0, NULL, NULL);
+    // Launch the GPU Kernel here
+    err = clEnqueueNDRangeKernel(queue, downsample_kernel, 2, NULL, global_item_size, local_item_size, 0, NULL, NULL);
     CHECK_ERR(err, "clEnqueueNDRangeKernel");
 
+
+    // ------------ FRAME 2 ----------- //
+    printf("Frame 2...\n");
+    // Write to GPU
+    err = clEnqueueWriteBuffer(queue, device_b0, CL_TRUE, 0, height_0 * width_0 * sizeof(float), input1->data, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueWriteBuffer");
+
+    // Arguments
+    err = clSetKernelArg(downsample_kernel, 0, sizeof(cl_mem), &device_b0);
+    CHECK_ERR(err, "clSetKernelArg");
+    err = clSetKernelArg(downsample_kernel, 1, sizeof(cl_mem), &device_b1);
+    CHECK_ERR(err, "clSetKernelArg");
+
+    // Launch the GPU Kernel here
+    err = clEnqueueNDRangeKernel(queue, downsample_kernel, 2, NULL, global_item_size, local_item_size, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueNDRangeKernel");
+
+
+
+
+    // ------------------------- DOWNSAMPLE LAYER 2 ------------------------ //
+    printf("Downsample layer 2...\n");
+    global_item_size[0] = ((width_2 + local_item_size[0] - 1) / local_item_size[0]) * local_item_size[0];
+    global_item_size[1] = ((height_2 + local_item_size[1] - 1) / local_item_size[1]) * local_item_size[1];
+
+    // Kernel arguments
+
+    //__global const float* src, __global float* dst, const int src_width, 
+    // const int src_height, const int dst_width, const int dst_height
+    err = clSetKernelArg(downsample_kernel, 0, sizeof(cl_mem), &device_a1);
+    CHECK_ERR(err, "clSetKernelArg");
+    err = clSetKernelArg(downsample_kernel, 1, sizeof(cl_mem), &device_a2);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(downsample_kernel, 2, sizeof(int), &width_1);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(downsample_kernel, 3, sizeof(int), &height_1);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(downsample_kernel, 4, sizeof(int), &width_2);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(downsample_kernel, 5, sizeof(int), &height_2);
+    CHECK_ERR(err, "clSetKernelArg");
+
+    // Launch the GPU Kernel here
+    err = clEnqueueNDRangeKernel(queue, downsample_kernel, 2, NULL, global_item_size, local_item_size, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueNDRangeKernel");
+
+
+    // ------------ FRAME 2 ----------- //
+    printf("Frame 2...\n");
+    // Arguments
+    err = clSetKernelArg(downsample_kernel, 0, sizeof(cl_mem), &device_b1);
+    CHECK_ERR(err, "clSetKernelArg");
+    err = clSetKernelArg(downsample_kernel, 1, sizeof(cl_mem), &device_b2);
+    CHECK_ERR(err, "clSetKernelArg");
+
+    // Launch the GPU Kernel here
+    err = clEnqueueNDRangeKernel(queue, downsample_kernel, 2, NULL, global_item_size, local_item_size, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueNDRangeKernel");
+
+
+
+
     //@@ Copy the GPU memory back to the CPU here
-    err = clEnqueueReadBuffer(queue, device_c, CL_TRUE, 0, size_a * sizeof(int), (*result).data, 0, NULL, NULL);
+    err = clEnqueueReadBuffer(queue, device_a2, CL_TRUE, 0, height_2 * width_2 * sizeof(float), result->data, 0, NULL, NULL);
+    result->shape[0] = height_2;
+    result->shape[1] = width_2;
     CHECK_ERR(err, "clEnqueueReadBuffer");
 
     //@@ Free the GPU memory here
-    clReleaseMemObject(device_a);
+    clReleaseMemObject(device_a0);
+    clReleaseMemObject(device_b0);
+    clReleaseMemObject(device_a1);
+    clReleaseMemObject(device_b1);
+    clReleaseMemObject(device_a2);
+    clReleaseMemObject(device_b2);
+
     clReleaseMemObject(device_c);
     clReleaseProgram(program);
-    clReleaseKernel(kernel);
+    clReleaseKernel(downsample_kernel);
+    //clReleaseKernel(gradient_kernel);
+    //clReleaseKernel(solver_kernel);
     clReleaseCommandQueue(queue);
     clReleaseContext(context);
     free(kernel_source);
@@ -139,45 +248,57 @@ int main(int argc, char *argv[])
     const char *input_file_d = argv[4];
 
     // Host input and output vectors and sizes
+    // host_a = input frame 1
+    // host_b = input frame 2
+    // host_c = output frame
     Matrix host_a, host_b, host_c, answer;
     
     cl_int err;
 
     int input_width, input_height, input_channels;
 
-    // load frame 1
+    // load frame 1, cast to float
+    printf("Load frame 1...\n");
     unsigned char *temp_pixels = stbi_load(input_file_a, &input_width, &input_height, &input_channels, 1);
     host_a.shape[0] = input_height;
     host_a.shape[1] = input_width;
-    host_a.data = (int *)malloc(sizeof(int) * input_height * input_width);
+    host_a.data = (float *)malloc(sizeof(float) * input_height * input_width);
     for (int i = 0; i < input_height * input_width; i++) {
-        host_a.data[i] = temp_pixels[i]; 
+        host_a.data[i] = (float)((float)temp_pixels[i])/255.0f; 
     }
 
-    // load frame 2
+    // load frame 2, cast to float
+    printf("Load frame 2...\n");
     temp_pixels = stbi_load(input_file_b, &input_width, &input_height, &input_channels, 1);
     host_b.shape[0] = input_height;
     host_b.shape[1] = input_width;
-    host_b.data = (int *)malloc(sizeof(int) * input_height * input_width);
+    host_b.data = (float *)malloc(sizeof(float) * input_height * input_width);
     for (int i = 0; i < input_height * input_width; i++) {
-        host_b.data[i] = temp_pixels[i]; 
+        host_b.data[i] = (float)((float)temp_pixels[i])/255.0f; 
     }
 
-    // Allocate the memory for the target.
-    host_c.shape[0] = input_height;
-    host_c.shape[1] = input_width;
-    host_c.data = (int *)malloc(sizeof(int) * host_c.shape[0] * host_c.shape[1]);
+    // Allocate the memory for the output.
+    printf("Allocate output...\n");
+    int output_channels = 1;
+    int output_width = (((input_width + 1) / 2) + 1) / 2;
+    int output_height = (((input_height + 1) / 2) + 1) / 2;
+
+    host_c.shape[0] = output_height;
+    host_c.shape[1] = output_width;
+    host_c.data = (float *)malloc(sizeof(float) * host_c.shape[0] * host_c.shape[1]);
 
     // Call your optical flow.
-    OpenCLOpticalFlow(&host_a, &host_c);
+    printf("Start optical flow...\n");
+    OpenCLOpticalFlow(&host_a, &host_b, &host_c);
 
-    unsigned char *output_bytes = (unsigned char *)malloc(input_height * input_width);
-    for (int i = 0; i < input_height * input_width; i++) {
-        output_bytes[i] = (unsigned char)host_c.data[i];
+    printf("Read output...\n");
+    unsigned char *output_bytes = (unsigned char *)malloc(output_height * output_width);
+    for (int i = 0; i < output_height * output_width; i++) {
+        output_bytes[i] = (unsigned char)(host_c.data[i] * 255);
     }
 
-    int output_channels = 1;
-    stbi_write_png(input_file_d, input_width, input_height, output_channels, output_bytes, input_width * output_channels);
+    stbi_write_png(input_file_d, output_width, output_height, output_channels, output_bytes, output_width * output_channels);
+    SaveMatrix("output.raw", &host_c);
 
 
 
@@ -189,6 +310,6 @@ int main(int argc, char *argv[])
     free(host_b.data);
     free(host_c.data);
     //free(answer.data);
-
+    printf("Done.\n");
     return 0;
 }

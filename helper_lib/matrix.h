@@ -13,7 +13,7 @@ extern "C" {
 
 typedef struct _Matrix
 {
-    int *data;
+    float *data;
     unsigned int shape[2];
 } Matrix;
 
