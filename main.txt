@@ -1,0 +1,116 @@
+void OpenCLMatrixMultiply(Matrix *input0, Matrix *input1, Matrix *result)
+{
+    // Load external OpenCL kernel code
+    char *kernel_source = OclLoadKernel("matrixMultiply.cl"); // Load kernel source
+
+    // Device input and output buffers
+    // frame 1, frame 2, output for now
+    cl_mem device_a, device_b, device_c;
+
+    cl_int err;
+
+    cl_device_id device_id;    // device ID
+    cl_context context;        // context
+    cl_command_queue queue;    // command queue
+    cl_program program;        // program
+    cl_kernel kernel;          // kernel
+
+    // Find platforms and devices
+    OclPlatformProp *platforms = NULL;
+    cl_uint num_platforms;
+
+    err = OclFindPlatforms((const OclPlatformProp **)&platforms, &num_platforms);
+    CHECK_ERR(err, "OclFindPlatforms");
+
+    // Get the ID for the specified kind of device type.
+    err = OclGetDeviceWithFallback(&device_id, OCL_DEVICE_TYPE);
+    CHECK_ERR(err, "OclGetDeviceWithFallback");
+
+    // Create a context
+    context = clCreateContext(0, 1, &device_id, NULL, NULL, &err);
+    CHECK_ERR(err, "clCreateContext");
+
+    // Create a command queue
+# if __APPLE__
+    queue = clCreateCommandQueue(context, device_id, 0, &err);
+#else
+    queue = clCreateCommandQueueWithProperties(context, device_id, 0, &err);
+#endif
+    CHECK_ERR(err, "clCreateCommandQueueWithProperties");
+
+    // Create the program from the source buffer
+    program = clCreateProgramWithSource(context, 1, (const char **)&kernel_source, NULL, &err);
+    CHECK_ERR(err, "clCreateProgramWithSource");
+
+    // Build the program executable
+    err = clBuildProgram(program, 0, NULL, NULL, NULL, NULL);
+    CHECK_ERR(err, "clBuildProgram");
+
+    // Create the compute kernel in the program we wish to run
+    kernel = clCreateKernel(program, "matrixMultiply", &err);
+    CHECK_ERR(err, "clCreateKernel");
+
+    //@@ Allocate GPU memory here
+    device_a = clCreateBuffer(context, CL_MEM_READ_ONLY, (*input0).shape[0] * (*input0).shape[1] * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer1");
+    device_b = clCreateBuffer(context, CL_MEM_READ_ONLY, (*input1).shape[0] * (*input1).shape[1] * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer2");
+    device_c = clCreateBuffer(context, CL_MEM_READ_ONLY, (*result).shape[0] * (*result).shape[1] * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer3");
+
+
+    //@@ Copy memory to the GPU here
+    err = clEnqueueWriteBuffer(queue, device_a, CL_TRUE, 0, (*input0).shape[0] * (*input0).shape[1] * sizeof(float), (*input0).data, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueWriteBuffer1");
+    err = clEnqueueWriteBuffer(queue, device_b, CL_TRUE, 0, (*input1).shape[0] * (*input1).shape[1] * sizeof(float), (*input1).data, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueWriteBuffer2");
+
+
+    //@@ define local and global work sizes
+    // mxn x nxp -> mxp
+    unsigned int size_a = (*input0).shape[0] * (*input1).shape[1]; // @@ replace this with length of the input vector(s)
+    size_t local_item_size = 512;
+    //err = clGetDeviceInfo(*device_id, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &local_item_size, NULL);
+    size_t global_item_size = ((size_a + local_item_size -1) / local_item_size) * local_item_size;
+
+
+
+    // Set the arguments to our compute kernel
+    // __global const int *A, __global const int *B, __global int *C,
+    // const unsigned int numARows, const unsigned int numAColumns,
+    // const unsigned int numBRows, const unsigned int numBColumns,
+    // const unsigned int numCRows, const unsigned int numCColumns
+    err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &device_a);
+    CHECK_ERR(err, "clSetKernelArg 0");
+    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &device_b);
+    CHECK_ERR(err, "clSetKernelArg 1");
+    err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &device_c);
+    CHECK_ERR(err, "clSetKernelArg 2");
+    err |= clSetKernelArg(kernel, 3, sizeof(unsigned int), &input0->shape[0]);
+    CHECK_ERR(err, "clSetKernelArg 3");
+    err |= clSetKernelArg(kernel, 4, sizeof(unsigned int), &input0->shape[1]);
+    CHECK_ERR(err, "clSetKernelArg 4");
+    err |= clSetKernelArg(kernel, 5, sizeof(unsigned int), &input1->shape[0]);
+    CHECK_ERR(err, "clSetKernelArg 5");
+    err |= clSetKernelArg(kernel, 6, sizeof(unsigned int), &input1->shape[1]);
+    CHECK_ERR(err, "clSetKernelArg 6");
+    err |= clSetKernelArg(kernel, 7, sizeof(unsigned int), &result->shape[0]);
+    CHECK_ERR(err, "clSetKernelArg 7");
+    err |= clSetKernelArg(kernel, 8, sizeof(unsigned int), &result->shape[1]);
+    CHECK_ERR(err, "clSetKernelArg 8");
+
+    //@@ Launch the GPU Kernel here
+    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_item_size, &local_item_size, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueNDRangeKernel");
+
+    //@@ Copy the GPU memory back to the CPU here
+    err = clEnqueueReadBuffer(queue, device_c, CL_TRUE, 0, size_a * sizeof(float), (*result).data, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueReadBuffer");
+
+    //@@ Free the GPU memory here
+    clReleaseMemObject(device_a);
+    clReleaseMemObject(device_b);
+    clReleaseMemObject(device_c);
+    clReleaseProgram(program);
+    clReleaseKernel(kernel);
+}
