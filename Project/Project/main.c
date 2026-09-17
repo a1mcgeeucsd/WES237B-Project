@@ -38,29 +38,29 @@
  * @param kernel cl_kernel
  * @param work_dim work dimensionality
  * @param local_work_size can calculate GWS off this and height/width
- * @param r_input raw float array input
  * @param ocl_input cl_mem input object
  * @param ocl_output cl_mem output object
  * @param width input matrix width
  * @param height input matrix height
  * @param downsample_rate how much we're downsampling by
  */
-void Downsample(
+void Convolve(
     cl_command_queue queue, 
     cl_kernel kernel, 
     cl_uint work_dim, 
     const size_t *local_work_size, 
-    Matrix *r_input,
     cl_mem *ocl_input, 
     cl_mem *ocl_output,
+    cl_mem *ocl_weights,
     size_t width,
     size_t height,
-    size_t downsample_rate
+    size_t filter_radius,
+    size_t stride
 ) 
 {
     cl_int err;
-    size_t ds_width = width / downsample_rate;
-    size_t ds_height = width / downsample_rate;
+    size_t ds_width = width / stride;
+    size_t ds_height = height / stride;
 
     // round to make sure GWS % LWS == 0
     size_t global_work_size[2] = {
@@ -76,13 +76,59 @@ void Downsample(
     CHECK_ERR(err, "clSetKernelArg");
     err = clSetKernelArg(kernel, 1, sizeof(cl_mem), ocl_output);
     CHECK_ERR(err, "clSetKernelArg");
-    err |= clSetKernelArg(kernel, 2, sizeof(int), &width);
+    err = clSetKernelArg(kernel, 2, sizeof(cl_mem), ocl_weights);
     CHECK_ERR(err, "clSetKernelArg");
-    err |= clSetKernelArg(kernel, 3, sizeof(int), &height);
+    err = clSetKernelArg(kernel, 3, sizeof(int), &filter_radius);
     CHECK_ERR(err, "clSetKernelArg");
-    err |= clSetKernelArg(kernel, 4, sizeof(int), &ds_width);
+    err = clSetKernelArg(kernel, 4, sizeof(int), &stride);
     CHECK_ERR(err, "clSetKernelArg");
-    err |= clSetKernelArg(kernel, 5, sizeof(int), &ds_height);
+    err |= clSetKernelArg(kernel, 5, sizeof(int), &width);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(kernel, 6, sizeof(int), &height);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(kernel, 7, sizeof(int), &ds_width);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(kernel, 8, sizeof(int), &ds_height);
+    CHECK_ERR(err, "clSetKernelArg");
+
+    // Launch the GPU Kernel here
+    err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueNDRangeKernel");
+}
+
+void CalculateTemporalGradient(
+    cl_command_queue queue, 
+    cl_kernel kernel, 
+    cl_uint work_dim, 
+    const size_t *local_work_size, 
+    cl_mem *ocl_input1, 
+    cl_mem *ocl_input2,
+    cl_mem *ocl_output,
+    size_t width,
+    size_t height
+) 
+{
+    cl_int err;
+
+    // round to make sure GWS % LWS == 0
+    size_t global_work_size[2] = {
+        ((width + local_work_size[0] - 1) / local_work_size[0]) * local_work_size[0],
+        ((height + local_work_size[1] - 1) / local_work_size[1]) * local_work_size[1]
+    };
+
+    // Kernel arguments
+
+    //__global const float* src, __global float* dst, const int src_width, 
+    // const int src_height
+    err = clSetKernelArg(kernel, 0, sizeof(cl_mem), ocl_input1);
+    CHECK_ERR(err, "clSetKernelArg");
+    err = clSetKernelArg(kernel, 1, sizeof(cl_mem), ocl_input2);
+    CHECK_ERR(err, "clSetKernelArg");
+    err = clSetKernelArg(kernel, 2, sizeof(cl_mem), ocl_output);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(kernel, 3, sizeof(int), &width);
+    CHECK_ERR(err, "clSetKernelArg");
+    err |= clSetKernelArg(kernel, 4, sizeof(int), &height);
     CHECK_ERR(err, "clSetKernelArg");
 
     // Launch the GPU Kernel here
@@ -112,8 +158,8 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     cl_context context;        // context
     cl_command_queue queue;    // command queue
     cl_program program;        // program
-    cl_kernel downsample_kernel;          // kernel
-    cl_kernel gradient_kernel;          // kernel
+    cl_kernel convolution_kernel;          // kernel
+    cl_kernel temporal_gradient_kernel;          // kernel
     cl_kernel solver_kernel;          // kernel
 
     // Find platforms and devices
@@ -124,6 +170,27 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     size_t local_item_size[2] = {16, 16};
     size_t global_item_size[2];
 
+
+    float gaussian_weights[25] = {
+        0.00390625f, 0.015625f, 0.0234375f, 0.015625f, 0.00390625f,
+        0.015625f,   0.0625f,   0.09375f,   0.0625f,   0.015625f, 
+        0.0234375f,  0.09375f,  0.140625f,  0.09375f,  0.0234375f,
+        0.015625f,   0.0625f,   0.09375f,   0.0625f,   0.015625f,
+        0.00390625f, 0.015625f, 0.0234375f, 0.015625f, 0.00390625f
+    };
+    size_t gaussian_radius = 2;
+
+    float sobel_x_weights[9] = {
+        -1.0f,  0.0f,  1.0f,
+        -2.0f,  0.0f,  2.0f,
+        -1.0f,  0.0f,  1.0f
+    };
+    float sobel_y_weights[9] = {
+        -1.0f, -2.0f, -1.0f,
+        0.0f,  0.0f,  0.0f,
+        1.0f,  2.0f,  1.0f
+    };
+    size_t sobel_radius = 1;
 
     err = OclFindPlatforms((const OclPlatformProp **)&platforms, &num_platforms);
     CHECK_ERR(err, "OclFindPlatforms");
@@ -153,7 +220,9 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     CHECK_ERR(err, "clBuildProgram");
 
     // Create the compute kernel in the program we wish to run
-    downsample_kernel = clCreateKernel(program, "lk_downsample", &err);
+    convolution_kernel = clCreateKernel(program, "conv2d", &err);
+    CHECK_ERR(err, "clCreateKernel");
+    temporal_gradient_kernel = clCreateKernel(program, "temporalGradient", &err);
     CHECK_ERR(err, "clCreateKernel");
 
     printf("Kernels created\n");
@@ -169,6 +238,16 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     // stores frames on a pyramid layer basis
     cl_mem frame1s[PYR_LAYERS];
     cl_mem frame2s[PYR_LAYERS];
+    cl_mem frame1_Ix[PYR_LAYERS];
+    cl_mem frame1_Iy[PYR_LAYERS];
+    cl_mem frame2_Ix[PYR_LAYERS];
+    cl_mem frame2_Iy[PYR_LAYERS];
+    cl_mem It[PYR_LAYERS];
+
+    // stores convolution filters
+    cl_mem gaussian_2d;
+    cl_mem sobel_x;
+    cl_mem sobel_y;
 
     // allocate storage for pyramid layers
     for (int i = 0; i < PYR_LAYERS; ++i) {
@@ -176,7 +255,25 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
         CHECK_ERR(err, "clCreateBuffer");
         frame2s[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
         CHECK_ERR(err, "clCreateBuffer");
+        frame1_Ix[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        CHECK_ERR(err, "clCreateBuffer");
+        frame1_Iy[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        CHECK_ERR(err, "clCreateBuffer");
+        frame2_Ix[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        CHECK_ERR(err, "clCreateBuffer");
+        frame2_Iy[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        CHECK_ERR(err, "clCreateBuffer");
+        It[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        CHECK_ERR(err, "clCreateBuffer");
     }
+
+    // allocate storage for convolution kernels
+    gaussian_2d = clCreateBuffer(context, CL_MEM_READ_ONLY, (gaussian_radius * 2 + 1) * (gaussian_radius * 2 + 1) * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+    sobel_x = clCreateBuffer(context, CL_MEM_READ_ONLY, (sobel_radius * 2 + 1) * (sobel_radius * 2 + 1) * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+    sobel_y = clCreateBuffer(context, CL_MEM_READ_ONLY, (sobel_radius * 2 + 1) * (sobel_radius * 2 + 1) * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
 
     // enqueue initial images
     err = clEnqueueWriteBuffer(queue, frame1s[0], CL_TRUE, 0, height * width * sizeof(float), input0->data, 0, NULL, NULL);
@@ -184,20 +281,56 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     err = clEnqueueWriteBuffer(queue, frame2s[0], CL_TRUE, 0, height * width * sizeof(float), input1->data, 0, NULL, NULL);
     CHECK_ERR(err, "clEnqueueWriteBuffer");
 
+    // enqueue convolution kernels
+    err = clEnqueueWriteBuffer(queue, gaussian_2d, CL_TRUE, 0, (gaussian_radius * 2 + 1) * (gaussian_radius * 2 + 1) * sizeof(float), gaussian_weights, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueWriteBuffer");
+    err = clEnqueueWriteBuffer(queue, sobel_x, CL_TRUE, 0, (sobel_radius * 2 + 1) * (sobel_radius * 2 + 1) * sizeof(float), sobel_x_weights, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueWriteBuffer");
+    err = clEnqueueWriteBuffer(queue, sobel_y, CL_TRUE, 0, (sobel_radius * 2 + 1) * (sobel_radius * 2 + 1) * sizeof(float), sobel_y_weights, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueWriteBuffer");
+
     // downsample each layer into the next
-    for (int i = 0; i < 2; ++i) {
-        Downsample(
-            queue, downsample_kernel, WORK_DIM, local_item_size, input0, &frame1s[i], &frame1s[i+1], width / pow(DSR, i), height / pow(DSR, i), DSR
+    for (int i = 0; i < PYR_LAYERS - 1; ++i) {
+        Convolve(
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1s[i], &frame1s[i+1], &gaussian_2d, width / pow(DSR, i), height / pow(DSR, i), gaussian_radius, DSR
         );
-        Downsample(
-            queue, downsample_kernel, WORK_DIM, local_item_size, input1, &frame2s[i], &frame2s[i+1], width / pow(DSR, i), height / pow(DSR , i), DSR
+        Convolve(
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2s[i], &frame2s[i+1], &gaussian_2d, width / pow(DSR, i), height / pow(DSR , i), gaussian_radius, DSR
         );
     }
 
+    // calculate spatial gradients
+    for (int i = 0; i < PYR_LAYERS; ++i) {
+        Convolve(
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1s[i], &frame1_Ix[i], &sobel_x, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+        );
+        Convolve(
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1s[i], &frame1_Iy[i], &sobel_y, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+        );
+        Convolve(
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2s[i], &frame2_Ix[i], &sobel_x, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+        );
+        Convolve(
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2s[i], &frame2_Iy[i], &sobel_y, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+        );
+    }
+
+    // calculate temporal gradient
+    for (int i = 0; i < PYR_LAYERS; i++) {
+        CalculateTemporalGradient(
+            queue, temporal_gradient_kernel, WORK_DIM, local_item_size, &frame1s[i], &frame2s[i], &It[i], width / pow(DSR, i), height / pow(DSR, i)
+        );
+    }
+
+
     //@@ Copy the GPU memory back to the CPU here
-    err = clEnqueueReadBuffer(queue, frame1s[PYR_LAYERS - 1], CL_TRUE, 0, height * width / pow(pow(DSR, PYR_LAYERS - 1), 2) * sizeof(float), result->data, 0, NULL, NULL);
+    /*err = clEnqueueReadBuffer(queue, It[PYR_LAYERS - 1], CL_TRUE, 0, height * width / pow(pow(DSR, PYR_LAYERS - 1), 2) * sizeof(float), result->data, 0, NULL, NULL);
     result->shape[0] = height / pow(DSR, PYR_LAYERS - 1);
-    result->shape[1] = width / pow(DSR, PYR_LAYERS - 1);
+    result->shape[1] = width / pow(DSR, PYR_LAYERS - 1);*/
+
+    err = clEnqueueReadBuffer(queue, It[0], CL_TRUE, 0, height * width * sizeof(float), result->data, 0, NULL, NULL);
+    result->shape[0] = height;
+    result->shape[1] = width;
     CHECK_ERR(err, "clEnqueueReadBuffer");
 
 
@@ -205,12 +338,17 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     for (int i = 0; i < PYR_LAYERS; i++) {
         clReleaseMemObject(frame1s[i]);
         clReleaseMemObject(frame2s[i]);
+        clReleaseMemObject(frame1_Ix[i]);
+        clReleaseMemObject(frame2_Ix[i]);
+        clReleaseMemObject(frame1_Iy[i]);
+        clReleaseMemObject(frame2_Iy[i]);
+        clReleaseMemObject(It[i]);
     }
 
     clReleaseMemObject(device_c);
     clReleaseProgram(program);
-    clReleaseKernel(downsample_kernel);
-    //clReleaseKernel(gradient_kernel);
+    clReleaseKernel(convolution_kernel);
+    clReleaseKernel(temporal_gradient_kernel);
     //clReleaseKernel(solver_kernel);
     clReleaseCommandQueue(queue);
     clReleaseContext(context);
@@ -263,8 +401,8 @@ int main(int argc, char *argv[])
     // Allocate the memory for the output.
     printf("Allocate output...\n");
     int output_channels = 1;
-    int output_width = (((input_width + 1) / 2) + 1) / 2;
-    int output_height = (((input_height + 1) / 2) + 1) / 2;
+    int output_width = input_width; //(((input_width + 1) / 2) + 1) / 2;
+    int output_height = input_height; //(((input_height + 1) / 2) + 1) / 2;
 
     host_c.shape[0] = output_height;
     host_c.shape[1] = output_width;
