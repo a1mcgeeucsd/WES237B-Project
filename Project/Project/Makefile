@@ -1,4 +1,4 @@
-CC       = gcc
+CC       = g++
 CFLAGS   = -g -Wall
 INCFLAGS := -I../../helper_lib
 LDFLAGS  := ../../helper_lib/helper_lib.a -lm
@@ -8,13 +8,15 @@ ifeq ($(shell uname -o), Darwin)
 else ifeq ($(shell uname -o), GNU/Linux) # Assumes NVIDIA GPU
 	LDFLAGS  += -L/usr/local/cuda/lib64 -lOpenCL
 	INCFLAGS += -I/usr/local/cuda/include
+	INCFLAGS += -I../../helper_lib/flow-code
+	INCFLAGS += -I../../helper_lib/flow-code/imageLib
 else # Android
 	LDFLAGS += -lOpenCL
 endif
 
 all: solution
 
-solution: ../../helper_lib/helper_lib.a main.c
+solution: main.cpp ../../helper_lib/helper_lib.a
 	$(CC) $(CFLAGS) -o $@ $^ $(INCFLAGS) $(LDFLAGS)
 
 ../../helper_lib/helper_lib.a: 
