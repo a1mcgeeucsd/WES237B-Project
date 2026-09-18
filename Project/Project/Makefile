@@ -1,7 +1,7 @@
 CC       = g++
 CFLAGS   = -g -Wall
 INCFLAGS := -I../../helper_lib
-LDFLAGS  := ../../helper_lib/helper_lib.a -lm
+LDFLAGS  := ../../helper_lib/helper_lib.a -lm -lclblast
 
 ifeq ($(shell uname -o), Darwin)
 	LDFLAGS += -framework OpenCL
@@ -16,7 +16,7 @@ endif
 
 all: solution
 
-solution: main.cpp ../../helper_lib/helper_lib.a
+solution: ../../helper_lib/helper_lib.a main.cpp
 	$(CC) $(CFLAGS) -o $@ $^ $(INCFLAGS) $(LDFLAGS)
 
 ../../helper_lib/helper_lib.a: 
