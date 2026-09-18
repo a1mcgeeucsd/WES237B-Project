@@ -58,3 +58,120 @@ __kernel void temporalGradient(
         dst[y * src_width + x] = src2[y * src_width + x] - src1[y * src_width + x];
     }
 }
+
+__kernel void hadamardProduct(
+    __global const float *A,
+    __global const float *B,
+    __global float *C,
+    const int width,
+    const int height
+)
+{
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    if (x < width && y < height) {
+        C[y * width + x] = A[y * width + x] * B[y * width + x];
+    }
+}
+
+__kernel void shiTomasi(
+    __global const float *I_x,
+    __global const float *I_y,
+    __global float *response,
+    const int width,
+    const int height,
+    const int block_size
+)
+{
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+
+    int radius = block_size / 2;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    // construct [A B \\ B C]
+    float A = 0;
+    float B = 0;
+    float C = 0;
+    float l1, l2;
+
+    // calculate I_x^2, I_x * I_y, I_y^2 over block neighborhood
+    for (int i = -radius; i < radius; ++i) {
+        if ((x + i) < 0 || (x + i) >= height) {
+            continue;
+        }
+
+        for (int j = -radius; j < radius; ++j) {
+            if ((y + j) < 0 || (y + j) >= width) {
+                continue;
+            }
+            A += I_x[(y + i) * width + x + j] * I_x[(y + i) * width + x + j];
+            B += I_x[(y + i) * width + x + j] * I_y[(y + i) * width + x + j];
+            C += I_y[(y + i) * width + x + j] * I_y[(y + i) * width + x + j];
+        }
+    }
+
+    // find eigenvalues
+    l1 = (A + C + sqrt((A - C) * (A - C) + 4 * B * B)) / 2;
+    l2 = (A + C - sqrt((A - C) * (A - C) + 4 * B * B)) / 2;
+
+    response[y * width + x] = (l1 < l2) ? l1 : l2;
+}
+
+__kernel void constructLKVector(
+    __global const float *I_x,
+    __global const float *I_y,
+    __global const float *I_t,
+    __global float *A,
+    __global float *b,
+    const int width,
+    const int height,
+    const int window
+)
+{
+    int batch = get_global_id(0);
+    int k1   = get_global_id(1);
+    int k2   = get_global_id(2);
+
+    int radius = window / 2;
+
+    int o_width  = width  - window + 1;
+    int o_height = height - window + 1;
+
+    // Position of the center pixel
+    int out_x = batch % o_width;
+    int out_y = batch / o_width;
+
+    int center_x = out_x + radius;
+    int center_y = out_y + radius;
+
+    // Position inside the window
+    int x = center_x + k2 - radius;
+    int y = center_y + k1 - radius;
+
+    // Shouldn't be necessary for a valid window,
+    // but harmless as a safety check.
+    if (x < 0 || x >= width ||
+        y < 0 || y >= height)
+    {
+        return;
+    }
+
+    int image_idx = y * width + x;
+
+    int window_idx = k1 * window + k2;
+
+    // A[batch] is a window^2 x 2 matrix
+    int A_idx = (batch * window * window + window_idx) * 2;
+
+    A[A_idx + 0] = I_x[image_idx];
+    A[A_idx + 1] = I_y[image_idx];
+
+    // b[batch] is a window^2 x 1 vector
+    int b_idx = batch * window * window + window_idx;
+
+    b[b_idx] = -I_t[image_idx];
+}
