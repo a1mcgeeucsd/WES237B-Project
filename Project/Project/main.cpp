@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <cstdlib> 
 
 #include "device.h"
 #include "kernel.h"
@@ -8,6 +9,7 @@
 
 #include "flow-code/imageLib/Image.h"
 #include "flow-code/flowIO.h"
+#include "flow-code/colorcode.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -417,10 +419,9 @@ int main(int argc, char *argv[])
             img.Pixel(x, y, 1) = host_c.data[y * input_width + x];
         }
     }
-    WriteFlowFile(img, "output.png");
+    WriteFlowFile(img, "output.flo");
 
-    // Check the result of the matrix multiply
-    //CheckMatrix(&answer, &host_c);
+    std::system("../../helper_lib/flow-code/color_flow output.flo outputcolors.png");
 
     // Release host memory
     free(host_a.data);
