@@ -175,3 +175,27 @@ __kernel void constructLKVector(
 
     b[b_idx] = -I_t[image_idx];
 }
+
+__kernel void inPlaceInvert2x2Matrix(
+    __global float * ATA
+)
+{
+    int batch_id = get_global_id(0);
+
+    float a = ATA[batch_id * 4 + 0];
+    float b = ATA[batch_id * 4 + 1];
+    float c = ATA[batch_id * 4 + 2];
+    float d = ATA[batch_id * 4 + 3];
+
+    float det = a * d - b * c;
+    if (det < 1e-6f) {
+        ATA[batch_id * 4 + 0] = ATA[batch_id * 4 + 1] = ATA[batch_id * 4 + 2] = ATA[batch_id * 4 + 3] = -1;
+    }
+
+    ATA[batch_id * 4 + 0] = d / det;
+    ATA[batch_id * 4 + 1] = -b / det;
+    ATA[batch_id * 4 + 2] = -c / det;
+    ATA[batch_id * 4 + 3] = a / det;
+
+
+}

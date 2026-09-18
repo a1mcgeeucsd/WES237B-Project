@@ -221,7 +221,7 @@ void ShiTomasiCornerDetection(
     CHECK_ERR(err, "clSetKernelArg 0");
     err = clSetKernelArg(kernel, 1, sizeof(cl_mem), I_y);
     CHECK_ERR(err, "clSetKernelArg 1");
-    err = clSetKernelArg(kernel, 2, sizeof(cl_mem), device_st_response);
+    err = clSetKernelArg(kernel, 2, sizeof(cl_mem), &device_st_response);
     CHECK_ERR(err, "clSetKernelArg 2");
     err = clSetKernelArg(kernel, 3, sizeof(int), &width);
     CHECK_ERR(err, "clSetKernelArg 3");
@@ -243,11 +243,9 @@ void ShiTomasiCornerDetection(
     // find maximum value 
     // - max * threshold is minimum quality level
     float max = 0;
-    int max_idx = -1;
     for (int i = 0; i < width * height; ++i) {
         if (st_response[i] > max) {
             max = st_response[i];
-            max_idx = i;
         }
     }
 
@@ -285,7 +283,8 @@ void ShiTomasiCornerDetection(
 
 void Solver(
     cl_command_queue queue,
-    cl_kernel kernel,
+    cl_kernel stack_kernel,
+    cl_kernel invert_kernel,
     cl_context context,
     cl_mem *image, 
     cl_mem *I_x,
@@ -308,31 +307,31 @@ void Solver(
     int A_sz = 2 * K * K * o_width * o_height;
     int b_sz = 1 * K * K * o_width * o_height;
 
-    cl_mem device_A = clCreateBuffer(context, CL_MEM_READ_WRITE, A_sz, NULL, &err);
+    cl_mem device_A = clCreateBuffer(context, CL_MEM_READ_WRITE, A_sz * sizeof(float), NULL, &err);
     CHECK_ERR(err, "clCreateBuffer");
 
-    cl_mem device_b = clCreateBuffer(context, CL_MEM_READ_WRITE, b_sz, NULL, &err);
+    cl_mem device_b = clCreateBuffer(context, CL_MEM_READ_WRITE, b_sz * sizeof(float), NULL, &err);
     CHECK_ERR(err, "clCreateBuffer");
 
     // __kernel void constructLKVector(
     // __global const float * I_x, __global const float * I_y, __global const float * I_t,
     // __global float * A, __global float * b,
     // const int width, const int height, const int window)
-    err = clSetKernelArg(kernel, 0, sizeof(cl_mem), I_x);
+    err = clSetKernelArg(stack_kernel, 0, sizeof(cl_mem), I_x);
     CHECK_ERR(err, "clSetKernelArg 0");
-    err = clSetKernelArg(kernel, 1, sizeof(cl_mem), I_y);
+    err = clSetKernelArg(stack_kernel, 1, sizeof(cl_mem), I_y);
     CHECK_ERR(err, "clSetKernelArg 1");
-    err = clSetKernelArg(kernel, 2, sizeof(cl_mem), I_t);
+    err = clSetKernelArg(stack_kernel, 2, sizeof(cl_mem), I_t);
     CHECK_ERR(err, "clSetKernelArg 2");
-    err = clSetKernelArg(kernel, 3, sizeof(cl_mem), device_A);
+    err = clSetKernelArg(stack_kernel, 3, sizeof(cl_mem), &device_A);
     CHECK_ERR(err, "clSetKernelArg 3");
-    err = clSetKernelArg(kernel, 4, sizeof(cl_mem), device_b);
+    err = clSetKernelArg(stack_kernel, 4, sizeof(cl_mem), &device_b);
     CHECK_ERR(err, "clSetKernelArg 4");
-    err = clSetKernelArg(kernel, 5, sizeof(int), &width);
+    err = clSetKernelArg(stack_kernel, 5, sizeof(int), &width);
     CHECK_ERR(err, "clSetKernelArg 5");
-    err = clSetKernelArg(kernel, 6, sizeof(int), &height);
+    err = clSetKernelArg(stack_kernel, 6, sizeof(int), &height);
     CHECK_ERR(err, "clSetKernelArg 6");
-    err = clSetKernelArg(kernel, 7, sizeof(int), &K);
+    err = clSetKernelArg(stack_kernel, 7, sizeof(int), &K);
     CHECK_ERR(err, "clSetKernelArg 7");
 
     // do an im2col type construction of our Gemm input
@@ -340,7 +339,7 @@ void Solver(
     size_t gws[3] = {((B + 15) / 16) * 16, K, K};
     size_t lws[3] = {16, 1, 1};
 
-    err = clEnqueueNDRangeKernel(queue, kernel, 3, 0, gws, lws, 0, NULL, NULL);
+    err = clEnqueueNDRangeKernel(queue, stack_kernel, 3, 0, gws, lws, 0, NULL, NULL);
     CHECK_ERR(err, "clEnqueueNDRangeKernel");
 
     // solution is v = (A^T A)^(-1) A^T b
@@ -351,10 +350,16 @@ void Solver(
 
     std::vector<size_t> a_offsets = std::vector<size_t>(B, 0);
     std::vector<size_t> ata_offsets = std::vector<size_t>(B, 0);
+    std::vector<size_t> ata_inv_at_offsets = std::vector<size_t>(B, 0);
+    std::vector<size_t> b_offsets = std::vector<size_t>(B, 0);
+    std::vector<size_t> v_offsets = std::vector<size_t>(B, 0);
 
-    for (int i = 0; i < B; ++i) {
+    for (size_t i = 0; i < B; ++i) {
         a_offsets[i] = i * K * K * 2;
         ata_offsets[i] = i * 2 * 2;
+        ata_inv_at_offsets[i] = i * K * K * 2;
+        b_offsets[i] = i * K * K;
+        v_offsets[i] = 2 * i;
     }
 
     std::vector<float> alphas = std::vector<float>(B, 1.0f);
@@ -376,10 +381,58 @@ void Solver(
         B, &queue
     );
     CHECK_ERR((cl_int)cl_err, "GemmBatched");
+    clblast::ClearCache();
+
+    // invert A^T A
+    err = clSetKernelArg(invert_kernel, 0, sizeof(cl_mem), &device_ATA);
+    CHECK_ERR(err, "clSetKernelArg");
+
+    size_t gws_inv[1] = {B};
+    size_t lws_inv[1] = {1};
+    err = clEnqueueNDRangeKernel(queue, invert_kernel, 1, 0, gws_inv, lws_inv, 0, NULL, NULL);
+    CHECK_ERR(err, "clEnqueueNDRangeKernel");
+
+    // Calculate (A^T A)^(-1) A^T
+    cl_mem device_ATA_inv_AT = clCreateBuffer(context, CL_MEM_READ_WRITE, B * 2 * K * K * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+
+    cl_err = clblast::GemmBatched(
+        clblast::Layout::kRowMajor,
+        clblast::Transpose::kNo,
+        clblast::Transpose::kYes,
+        2, K * K, 2,
+        alphas.data(),
+        device_ATA, ata_offsets.data(), 2,
+        device_A, a_offsets.data(), 2,
+        betas.data(),
+        device_ATA_inv_AT, ata_inv_at_offsets.data(), K * K,
+        B, &queue
+    );
+    CHECK_ERR((cl_int)cl_err, "GemmBatched");
+    clblast::ClearCache();
+
+    // Calculate (A^T A)^(-1) A^T
+    cl_mem device_v = clCreateBuffer(context, CL_MEM_READ_WRITE, B * 2 * sizeof(float), NULL, &err);
+    CHECK_ERR(err, "clCreateBuffer");
+
+    cl_err = clblast::GemmBatched(
+        clblast::Layout::kRowMajor,
+        clblast::Transpose::kNo,
+        clblast::Transpose::kNo,
+        2, 1, K * K,
+        alphas.data(),
+        device_ATA_inv_AT, ata_inv_at_offsets.data(), K*K,
+        device_b, b_offsets.data(), 1,
+        betas.data(),
+        device_v, v_offsets.data(), 1,
+        B, &queue
+    );
 
     clblast::ClearCache();
     clReleaseMemObject(device_A);
     clReleaseMemObject(device_b);
+    clReleaseMemObject(device_ATA);
+    clReleaseMemObject(device_ATA_inv_AT);
 }
 
 void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
@@ -396,7 +449,6 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     // device_b2 = frame 2
     // device_
     // device_c = output (float, 0 to 1.0f)
-    cl_mem device_a0, device_b0, device_a1, device_b1, device_a2, device_b2, device_c;
 
     cl_int err;
 
@@ -406,7 +458,8 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     cl_program program;        // program
     cl_kernel convolution_kernel;          // kernel
     cl_kernel temporal_gradient_kernel;          // kernel
-    cl_kernel solver_kernel;          // kernel
+    cl_kernel stack_kernel;          // kernel
+    cl_kernel invert_kernel;
 
     // Find platforms and devices
     OclPlatformProp *platforms = NULL;
@@ -414,7 +467,6 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
 
     //@@ define local and global work sizes
     size_t local_item_size[2] = {16, 16};
-    size_t global_item_size[2];
 
     err = OclFindPlatforms((const OclPlatformProp **)&platforms, &num_platforms);
     CHECK_ERR(err, "OclFindPlatforms");
@@ -448,6 +500,10 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     CHECK_ERR(err, "clCreateKernel");
     temporal_gradient_kernel = clCreateKernel(program, "temporalGradient", &err);
     CHECK_ERR(err, "clCreateKernel");
+    stack_kernel = clCreateKernel(program, "constructLKVector", &err);
+    CHECK_ERR(err, "clCreateKernel");
+    invert_kernel = clCreateKernel(program, "inPlaceInvert2x2Matrix", &err);
+    CHECK_ERR(err, "clCreateKernel");
 
     printf("Kernels created\n");
     
@@ -456,7 +512,7 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     int width = input0->shape[1];
 
     // Output
-    device_c = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width * sizeof(float), NULL, &err);
+    cl_mem device_c = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width * sizeof(float), NULL, &err);
     CHECK_ERR(err, "clCreateBuffer");
 
     // stores frames on a pyramid layer basis
@@ -552,6 +608,11 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
         );
     }
 
+    for (int i = 0; i < PYR_LAYERS; i++) {
+        Solver(
+            queue, stack_kernel, invert_kernel, context, &frame1s[i], &frame1_Ix[i], &frame1_Iy[i], &It[i], width, height, 7 
+        );
+    }
 
     //@@ Copy the GPU memory back to the CPU here
     /*err = clEnqueueReadBuffer(queue, It[PYR_LAYERS - 1], CL_TRUE, 0, height * width / pow(pow(DSR, PYR_LAYERS - 1), 2) * sizeof(float), result->data, 0, NULL, NULL);
@@ -602,10 +663,8 @@ int main(int argc, char *argv[])
     // host_a = input frame 1
     // host_b = input frame 2
     // host_c = output frame
-    Matrix host_a, host_b, host_c, answer;
+    Matrix host_a, host_b, host_c;
     
-    cl_int err;
-
     int input_width, input_height, input_channels;
 
     // load frame 1, cast to float
