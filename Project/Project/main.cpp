@@ -295,6 +295,8 @@ void Solver(
     cl_mem *I_x,
     cl_mem *I_y,
     cl_mem *I_t,
+    cl_mem *u,
+    cl_mem *v,
     const int width,
     const int height,
     int K
@@ -440,7 +442,7 @@ void Solver(
     clReleaseMemObject(device_ATA_inv_AT);
 }
 
-void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
+void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix *result_y)
 {
     // Load external OpenCL kernel code
     char *kernel_source = OclLoadKernel("opticalFlow.cl"); // Load kernel source
@@ -518,6 +520,8 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     cl_mem frame2_Ix[PYR_LAYERS];
     cl_mem frame2_Iy[PYR_LAYERS];
     cl_mem It[PYR_LAYERS];
+    cl_mem u[PYR_LAYERS];
+    cl_mem v[PYR_LAYERS];
 
     // stores convolution filters
     cl_mem gaussian_2d;
@@ -539,6 +543,10 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
         frame2_Iy[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
         CHECK_ERR(err, "clCreateBuffer");
         It[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        CHECK_ERR(err, "clCreateBuffer");
+        u[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        CHECK_ERR(err, "clCreateBuffer");
+        v[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
         CHECK_ERR(err, "clCreateBuffer");
     }
 
@@ -605,7 +613,7 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
 
     for (int i = 0; i < PYR_LAYERS; i++) {
         Solver(
-            queue, stack_kernel, invert_kernel, context, &frame1s[i], &frame1_Ix[i], &frame1_Iy[i], &It[i], width, height, 7 
+            queue, stack_kernel, invert_kernel, context, &frame1s[i], &frame1_Ix[i], &frame1_Iy[i], &It[i], &u[i], &v[i], width, height, 7 
         );
     }
 
@@ -614,9 +622,14 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     result->shape[0] = height / pow(DSR, PYR_LAYERS - 1);
     result->shape[1] = width / pow(DSR, PYR_LAYERS - 1);*/
 
-    err = clEnqueueReadBuffer(queue, It[0], CL_TRUE, 0, height * width * sizeof(float), result->data, 0, NULL, NULL);
-    result->shape[0] = height;
-    result->shape[1] = width;
+    err = clEnqueueReadBuffer(queue, u[0], CL_TRUE, 0, height * width * sizeof(float), result_x->data, 0, NULL, NULL);
+    result_x->shape[0] = height;
+    result_y->shape[1] = width;
+    CHECK_ERR(err, "clEnqueueReadBuffer");
+
+    err = clEnqueueReadBuffer(queue, v[0], CL_TRUE, 0, height * width * sizeof(float), result_x->data, 0, NULL, NULL);
+    result_x->shape[0] = height;
+    result_y->shape[1] = width;
     CHECK_ERR(err, "clEnqueueReadBuffer");
 
 
@@ -629,6 +642,8 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
         clReleaseMemObject(frame1_Iy[i]);
         clReleaseMemObject(frame2_Iy[i]);
         clReleaseMemObject(It[i]);
+        clReleaseMemObject(u[i]);
+        clReleaseMemObject(v[i]);
     }
 
     clReleaseProgram(program);
@@ -657,7 +672,7 @@ int main(int argc, char *argv[])
     // host_a = input frame 1
     // host_b = input frame 2
     // host_c = output frame
-    Matrix host_a, host_b, host_c;
+    Matrix host_a, host_b, host_c, host_d;
     
     int input_width, input_height, input_channels;
 
@@ -691,9 +706,13 @@ int main(int argc, char *argv[])
     host_c.shape[1] = output_width;
     host_c.data = (float *)malloc(sizeof(float) * host_c.shape[0] * host_c.shape[1]);
 
+    host_d.shape[0] = output_height;
+    host_d.shape[1] = output_width;
+    host_d.data = (float *)malloc(sizeof(float) * host_d.shape[0] * host_d.shape[1]);
+
     // Call your optical flow.
     printf("Start optical flow...\n");
-    OpenCLOpticalFlow(&host_a, &host_b, &host_c);
+    OpenCLOpticalFlow(&host_a, &host_b, &host_c, &host_d);
 
     printf("Read output...\n");
     unsigned char *output_bytes = (unsigned char *)malloc(output_height * output_width);
@@ -709,7 +728,7 @@ int main(int argc, char *argv[])
     for (int x = 0; x < input_width; x++) {
         for (int y = 0; y < input_height; y++) {
             img.Pixel(x, y, 0) = host_c.data[y * input_width + x];
-            img.Pixel(x, y, 1) = host_c.data[y * input_width + x];
+            img.Pixel(x, y, 1) = host_d.data[y * input_width + x];
         }
     }
     WriteFlowFile(img, "output.flo");

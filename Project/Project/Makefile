@@ -23,7 +23,7 @@ solution: ../../helper_lib/helper_lib.a main.cpp
 	cd ../../helper_lib; make
 
 run: solution
-	./solution Dataset/other-data-gray/RubberWhale/frame07.png Dataset/other-data-gray/RubberWhale/frame08.png Dataset/0/output.raw output.png
+	./solution Dataset/other-data-gray/RubberWhale/frame10.png Dataset/other-data-gray/RubberWhale/frame11.png Dataset/0/output.raw output.png
 
 clean: 
 	rm -f solution
