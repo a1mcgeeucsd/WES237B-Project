@@ -12,7 +12,6 @@ __kernel void conv2d(
     int dst_x = get_global_id(0); 
     int dst_y = get_global_id(1); 
 
-    // Bounds guard check 
     if (dst_x >= dst_width || dst_y >= dst_height) return; 
 
     // Calculate center point in source image based on downsampling stride
@@ -188,8 +187,9 @@ __kernel void inPlaceInvert2x2Matrix(
     float d = ATA[batch_id * 4 + 3];
 
     float det = a * d - b * c;
-    if (det < 1e-6f) {
-        ATA[batch_id * 4 + 0] = ATA[batch_id * 4 + 1] = ATA[batch_id * 4 + 2] = ATA[batch_id * 4 + 3] = -1;
+    if (det < 1e-6f && det > -1e-6f) {
+        ATA[batch_id * 4 + 0] = ATA[batch_id * 4 + 1] = ATA[batch_id * 4 + 2] = ATA[batch_id * 4 + 3] = 0.0f;
+        return;
     }
 
     ATA[batch_id * 4 + 0] = d / det;
@@ -197,6 +197,114 @@ __kernel void inPlaceInvert2x2Matrix(
     ATA[batch_id * 4 + 2] = -c / det;
     ATA[batch_id * 4 + 3] = a / det;
 }
+
+    __kernel void backwardWarpBilinear(
+        __global const float *I2,   // Second input frame to be warped
+        __global const float *u,    // Current horizontal flow field (velocity)
+        __global const float *v,    // Current vertical flow field (velocity)
+        __global float *I2_warped,  // Output: Frame 2 aligned to Frame 1's coordinate space
+        const int width,
+        const int height
+    ) {
+        int x = get_global_id(0);
+        int y = get_global_id(1);
+
+        // Boundary check
+        if (x >= width || y >= height) {
+            return;
+        }
+
+        int idx = y * width + x;
+
+        // Calculate source floating-point coordinate in Frame 1
+        float src_x = (float)x + u[idx];
+        float src_y = (float)y + v[idx];
+
+        // Out-of-bounds check: if the flow points outside the image, fill with zero (or boundary pixel)
+        if (src_x < 0.0f || src_x > (float)(width - 1) || 
+            src_y < 0.0f || src_y > (float)(height - 1)) {
+            I2_warped[idx] = 0.0f; 
+            return;
+        }
+
+        // Find the 4 neighboring integer coordinates for bilinear interpolation
+        int x0 = (int)floor(src_x);
+        int y0 = (int)floor(src_y);
+        int x1 = min(x0 + 1, width - 1);
+        int y1 = min(y0 + 1, height - 1);
+
+        // Calculate interpolation weights (distances to top-left neighbor)
+        float tx = src_x - (float)x0;
+        float ty = src_y - (float)y0;
+
+        // Fetch the 4 neighbor pixel values from Frame 2
+        float p00 = I2[y0 * width + x0]; // Top-Left
+        float p10 = I2[y0 * width + x1]; // Top-Right
+        float p01 = I2[y1 * width + x0]; // Bottom-Left
+        float p11 = I2[y1 * width + x1]; // Bottom-Right
+
+        // Perform bilinear interpolation
+        float top    = p00 + tx * (p10 - p00);
+        float bottom = p01 + tx * (p11 - p01);
+        float final_pixel = top + ty * (bottom - top);
+
+        // Write out the warped frame pixel
+        I2_warped[idx] = final_pixel;
+    }
+
+    __kernel void upsample_kernel(
+        __global const float *coarse_flow, // Input: u or v field from the lower-res level
+        __global float *fine_flow,         // Output: Allocated buffer at the higher-res level
+        const int coarse_width,
+        const int coarse_height,
+        const int fine_width,
+        const int fine_height
+    ) {
+        // Each thread processes one unique pixel in the FINE (high-res) destination grid
+        int fine_x = get_global_id(0);
+        int fine_y = get_global_id(1);
+
+        // Boundary check
+        if (fine_x >= fine_width || fine_y >= fine_height) {
+            return;
+        }
+
+        int fine_idx = fine_y * fine_width + fine_x;
+
+        // Map fine grid coordinates back to coarse grid floating-point space.
+        // Subtracting 0.25f and aligning scales properly centers the pixel positions 
+        // across the 2x scale boundary, matching standard OpenCV/MATLAB pyramid rules.
+        float coarse_src_x = (float)fine_x * 0.5f;
+        float coarse_src_y = (float)fine_y * 0.5f;
+
+        // Clamp coordinates to valid coarse image boundaries
+        coarse_src_x = max(0.0f, min(coarse_src_x, (float)(coarse_width - 1)));
+        coarse_src_y = max(0.0f, min(coarse_src_y, (float)(coarse_height - 1)));
+
+        // Find the 4 neighboring integer pixels in the coarse grid
+        int x0 = (int)floor(coarse_src_x);
+        int y0 = (int)floor(coarse_src_y);
+        int x1 = min(x0 + 1, coarse_width - 1);
+        int y1 = min(y0 + 1, coarse_height - 1);
+
+        // Calculate bilinear interpolation weights
+        float tx = coarse_src_x - (float)x0;
+        float ty = coarse_src_y - (float)y0;
+
+        // Fetch the 4 coarse velocity samples
+        float p00 = coarse_flow[y0 * coarse_width + x0]; // Top-Left
+        float p10 = coarse_flow[y0 * coarse_width + x1]; // Top-Right
+        float p01 = coarse_flow[y1 * coarse_width + x0]; // Bottom-Left
+        float p11 = coarse_flow[y1 * coarse_width + x1]; // Bottom-Right
+
+        // Bilinear interpolation
+        float top    = p00 + tx * (p10 - p00);
+        float bottom = p01 + tx * (p11 - p01);
+        float coarse_velocity = top + ty * (bottom - top);
+
+        // CRITICAL STEPS: Multiply by 2.0f because the image space has doubled.
+        fine_flow[fine_idx] = coarse_velocity * 2.0f;
+    }
 
 __kernel void unterleave(
     __global const float *UV,
@@ -230,6 +338,6 @@ __kernel void unterleave(
     int out_idx = out_y * o_width + out_x;
 
     // UV is interleaved: [u0, v0, u1, v1, ...]
-    u[image_idx] = UV[2 * out_idx + 0];
-    v[image_idx] = UV[2 * out_idx + 1];
+    u[image_idx] += UV[2 * out_idx + 0];
+    v[image_idx] += UV[2 * out_idx + 1];
 }

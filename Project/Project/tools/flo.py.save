@@ -1,0 +1,28 @@
+import os
+import numpy as np
+
+# The magic tag for Middlebury .flo files
+TAG_FLOAT = 202021.25
+
+def read_flo_file(filename):
+    """Reads a Middlebury .flo optical flow file and returns a NumPy array."""
+    assert filename[-4:] == '.flo', f"File ending is not .flo: {filename}"
+    
+    with open(filename, 'rb') as f:
+        # Read and check the tag
+        flo_number = np.fromfile(f, np.float32, count=1)[0]
+        assert flo_number == TAG_FLOAT, f"Incorrect tag number {flo_number}. Invalid .flo file."
+        
+        # Read width and height
+        w = np.fromfile(f, np.int32, count=1)[0]
+        h = np.fromfile(f, np.int32, count=1)[0]
+        
+        # Read the flow data (2 bands: u and v components)
+        data = np.fromfile(f, np.float32, count=2 * w * h)
+        
+        # Reshape into a 3D array of shape (height, width, 2)
+        flow = data.reshape((h, w, 2))
+        
+    return flow
+
+read_flow_file(

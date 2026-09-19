@@ -38,6 +38,8 @@
 // Number of Pyramid Layers
 #define PYR_LAYERS 3
 
+#define WARPS 3
+
 #define FLOW_WINDOW 7
 
 const float gaussian_weights[25] = {
@@ -288,6 +290,92 @@ void ShiTomasiCornerDetection(
     free(st_response);
 }
 
+void Upsample(
+    cl_command_queue queue,
+    cl_kernel upsample_kernel,
+    cl_context context,
+    const size_t* local_work_size,
+    cl_mem *coarse_u,
+    cl_mem *fine_u,
+    cl_mem *coarse_v,
+    cl_mem *fine_v,
+    int coarse_w,
+    int fine_w,
+    int coarse_h,
+    int fine_h
+)
+{
+    clSetKernelArg(upsample_kernel, 0, sizeof(cl_mem), coarse_u);
+    clSetKernelArg(upsample_kernel, 1, sizeof(cl_mem), fine_u);
+    clSetKernelArg(upsample_kernel, 2, sizeof(int), &coarse_w);
+    clSetKernelArg(upsample_kernel, 3, sizeof(int), &coarse_h);
+    clSetKernelArg(upsample_kernel, 4, sizeof(int), &fine_w);
+    clSetKernelArg(upsample_kernel, 5, sizeof(int), &fine_h);
+
+    size_t global_work_size[2] = {
+        ((fine_w + local_work_size[0] - 1) / local_work_size[0]) * local_work_size[0],
+        ((fine_h + local_work_size[1] - 1) / local_work_size[1]) * local_work_size[1]
+    };
+
+    clEnqueueNDRangeKernel(queue, upsample_kernel, 2, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+
+    clSetKernelArg(upsample_kernel, 0, sizeof(cl_mem), coarse_v);
+    clSetKernelArg(upsample_kernel, 1, sizeof(cl_mem), fine_v);
+
+    clEnqueueNDRangeKernel(queue, upsample_kernel, 2, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+}
+
+void Warp(
+    cl_command_queue queue,
+    cl_kernel warp_kernel,
+    cl_context context,
+    const size_t* local_work_size,
+    cl_mem *frame2,
+    cl_mem *device_u,
+    cl_mem *device_v,
+    cl_mem *frame2_warped,
+    const int width,
+    const int height
+) 
+{
+    cl_int err;
+
+    // 1. Set the OpenCL kernel arguments sequentially
+    err = clSetKernelArg(warp_kernel, 0, sizeof(cl_mem), frame2);
+    CHECK_ERR(err, "clSetKernelArg 0 (I2)");
+    err = clSetKernelArg(warp_kernel, 1, sizeof(cl_mem), device_u);
+    CHECK_ERR(err, "clSetKernelArg 1 (u)");
+    err = clSetKernelArg(warp_kernel, 2, sizeof(cl_mem), device_v);
+    CHECK_ERR(err, "clSetKernelArg 2 (v)");
+    err = clSetKernelArg(warp_kernel, 3, sizeof(cl_mem), frame2_warped);
+    CHECK_ERR(err, "clSetKernelArg 3 (I2_warped)");
+    err = clSetKernelArg(warp_kernel, 4, sizeof(int), &width);
+    CHECK_ERR(err, "clSetKernelArg 4 (width)");
+    err = clSetKernelArg(warp_kernel, 5, sizeof(int), &height);
+    CHECK_ERR(err, "clSetKernelArg 5 (height)");
+
+    size_t global_work_size[2] = {
+        ((static_cast<size_t>(width)  + local_work_size[0] - 1) / local_work_size[0]) * local_work_size[0],
+        ((static_cast<size_t>(height) + local_work_size[1] - 1) / local_work_size[1]) * local_work_size[1]
+    };
+
+    // 3. Enqueue the kernel execution onto the target command queue
+    cl_event warp_event;
+    err = clEnqueueNDRangeKernel(
+        queue,
+        warp_kernel,
+        2, NULL, global_work_size, local_work_size, 0, NULL, &warp_event  // Returned execution event reference
+    );
+    CHECK_ERR(err, "clEnqueueNDRangeKernel (backwardWarpBilinear)");
+
+    err = clWaitForEvents(1, &warp_event);
+    CHECK_ERR(err, "clWaitForEvents");
+    
+    clReleaseEvent(warp_event);
+
+    return;
+}
+
 void Solver(
     cl_command_queue queue,
     cl_kernel stack_kernel,
@@ -351,7 +439,7 @@ void Solver(
 
     err = clEnqueueNDRangeKernel(queue, stack_kernel, 3, 0, gws, lws, 0, NULL, NULL);
     CHECK_ERR(err, "clEnqueueNDRangeKernel");
-
+    clFinish(queue);
     // solution is v = (A^T A)^(-1) A^T b
 
     const size_t m = 2;
@@ -390,6 +478,7 @@ void Solver(
         device_ATA, ata_offsets.data(), 2,
         B, &queue
     );
+    clFinish(queue);
     CHECK_ERR((cl_int)cl_err, "GemmBatched");
     clblast::ClearCache();
 
@@ -401,6 +490,7 @@ void Solver(
     size_t lws_inv[1] = {1};
     err = clEnqueueNDRangeKernel(queue, invert_kernel, 1, 0, gws_inv, lws_inv, 0, NULL, NULL);
     CHECK_ERR(err, "clEnqueueNDRangeKernel");
+    clFinish(queue);
 
     // Calculate (A^T A)^(-1) A^T
     cl_mem device_ATA_inv_AT = clCreateBuffer(context, CL_MEM_READ_WRITE, B * 2 * K * K * sizeof(float), NULL, &err);
@@ -419,6 +509,7 @@ void Solver(
         B, &queue
     );
     CHECK_ERR((cl_int)cl_err, "GemmBatched");
+    clFinish(queue);
     clblast::ClearCache();
 
     // Calculate (A^T A)^(-1) A^T
@@ -437,6 +528,7 @@ void Solver(
         device_v, v_offsets.data(), 1,
         B, &queue
     );
+    clFinish(queue);
 
     err = clSetKernelArg(unterleave_kernel, 0, sizeof(cl_mem), &device_v);
     CHECK_ERR(err, "clSetKernelArg 0");
@@ -453,7 +545,8 @@ void Solver(
     size_t gws_unt[2] = {(size_t)o_width, (size_t)o_height};
     size_t lws_unt[2] = {1, 1};
     clEnqueueNDRangeKernel(queue, unterleave_kernel, 2, NULL, gws_unt, lws_unt, 0, NULL, NULL);
-
+    clFinish(queue);
+    
     clblast::ClearCache();
     clReleaseMemObject(device_A);
     clReleaseMemObject(device_b);
@@ -462,7 +555,12 @@ void Solver(
     clReleaseMemObject(device_v);
 }
 
-void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix *result_y)
+void OpenCLOpticalFlow(
+    Matrix *input0, 
+    Matrix *input1, 
+    Matrix *result_x, 
+    Matrix *result_y,
+    Matrix *result)
 {
     // Load external OpenCL kernel code
     char *kernel_source = OclLoadKernel("opticalFlow.cl"); // Load kernel source
@@ -478,6 +576,8 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
     cl_kernel stack_kernel;          // kernel
     cl_kernel invert_kernel;
     cl_kernel unterleave_kernel;
+    cl_kernel upsample_kernel;
+    cl_kernel warp_kernel;
 
     // Find platforms and devices
     OclPlatformProp *platforms = NULL;
@@ -524,6 +624,11 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
     CHECK_ERR(err, "clCreateKernel");
     unterleave_kernel = clCreateKernel(program, "unterleave", &err);
     CHECK_ERR(err, "clCreateKernel");
+    upsample_kernel = clCreateKernel(program, "upsample_kernel", &err);
+    CHECK_ERR(err, "clCreateKernel");
+    warp_kernel = clCreateKernel(program, "backwardWarpBilinear", &err);
+    CHECK_ERR(err, "clCreateKernel");
+
 
     printf("Kernels created\n");
     
@@ -536,8 +641,9 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
     CHECK_ERR(err, "clCreateBuffer");
 
     // stores frames on a pyramid layer basis
-    cl_mem frame1s[PYR_LAYERS];
-    cl_mem frame2s[PYR_LAYERS];
+    cl_mem frame1[PYR_LAYERS];
+    cl_mem frame2[PYR_LAYERS];
+    cl_mem frame2_warped[PYR_LAYERS];
     cl_mem frame1_Ix[PYR_LAYERS];
     cl_mem frame1_Iy[PYR_LAYERS];
     cl_mem frame2_Ix[PYR_LAYERS];
@@ -553,9 +659,11 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
 
     // allocate storage for pyramid layers
     for (int i = 0; i < PYR_LAYERS; ++i) {
-        frame1s[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        frame1[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
         CHECK_ERR(err, "clCreateBuffer");
-        frame2s[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        frame2[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
+        CHECK_ERR(err, "clCreateBuffer");
+        frame2_warped[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
         CHECK_ERR(err, "clCreateBuffer");
         frame1_Ix[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
         CHECK_ERR(err, "clCreateBuffer");
@@ -567,6 +675,7 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
         CHECK_ERR(err, "clCreateBuffer");
         It[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
         CHECK_ERR(err, "clCreateBuffer");
+
         u[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
         CHECK_ERR(err, "clCreateBuffer");
         v[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, height * width / pow(pow(DSR, i), 2) * sizeof(float), NULL, &err);
@@ -582,10 +691,19 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
     CHECK_ERR(err, "clCreateBuffer");
 
     // enqueue initial images
-    err = clEnqueueWriteBuffer(queue, frame1s[0], CL_TRUE, 0, height * width * sizeof(float), input0->data, 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(queue, frame1[0], CL_TRUE, 0, height * width * sizeof(float), input0->data, 0, NULL, NULL);
     CHECK_ERR(err, "clEnqueueWriteBuffer");
-    err = clEnqueueWriteBuffer(queue, frame2s[0], CL_TRUE, 0, height * width * sizeof(float), input1->data, 0, NULL, NULL);
+    err = clEnqueueWriteBuffer(queue, frame2[0], CL_TRUE, 0, height * width * sizeof(float), input1->data, 0, NULL, NULL);
     CHECK_ERR(err, "clEnqueueWriteBuffer");
+
+    // enqueue initial buffers
+    float zero = 0.0f;
+    for (int i = 0; i < PYR_LAYERS; i++) {
+        err = clEnqueueFillBuffer(queue, v[i], &zero, sizeof(float), 0, height * width / pow(pow(DSR, i), 2) * sizeof(float), 0, NULL, NULL);
+        CHECK_ERR(err, "clEnqueueFillBuffer");
+        err = clEnqueueFillBuffer(queue, u[i], &zero, sizeof(float), 0, height * width / pow(pow(DSR, i), 2) * sizeof(float), 0, NULL, NULL);
+        CHECK_ERR(err, "clEnqueueFillBuffer");
+    }
 
     // enqueue convolution kernels
     err = clEnqueueWriteBuffer(queue, gaussian_2d, CL_TRUE, 0, (gaussian_radius * 2 + 1) * (gaussian_radius * 2 + 1) * sizeof(float), gaussian_weights, 0, NULL, NULL);
@@ -599,26 +717,26 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
     for (int i = 0; i < PYR_LAYERS - 1; ++i) {
         // Gaussian applied with downsampling rate stride to prevent aliasing
         Convolve(
-            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1s[i], &frame1s[i+1], &gaussian_2d, width / pow(DSR, i), height / pow(DSR, i), gaussian_radius, DSR
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1[i], &frame1[i+1], &gaussian_2d, width / pow(DSR, i), height / pow(DSR, i), gaussian_radius, DSR
         );
         Convolve(
-            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2s[i], &frame2s[i+1], &gaussian_2d, width / pow(DSR, i), height / pow(DSR , i), gaussian_radius, DSR
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2[i], &frame2[i+1], &gaussian_2d, width / pow(DSR, i), height / pow(DSR , i), gaussian_radius, DSR
         );
     }
 
     // calculate spatial gradients
     for (int i = 0; i < PYR_LAYERS; ++i) {
         Convolve(
-            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1s[i], &frame1_Ix[i], &sobel_x, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1[i], &frame1_Ix[i], &sobel_x, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
         );
         Convolve(
-            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1s[i], &frame1_Iy[i], &sobel_y, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame1[i], &frame1_Iy[i], &sobel_y, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
         );
         Convolve(
-            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2s[i], &frame2_Ix[i], &sobel_x, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2[i], &frame2_Ix[i], &sobel_x, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
         );
         Convolve(
-            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2s[i], &frame2_Iy[i], &sobel_y, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+            queue, convolution_kernel, WORK_DIM, local_item_size, &frame2[i], &frame2_Iy[i], &sobel_y, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
         );
     }
 
@@ -630,14 +748,45 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
     // calculate temporal gradient
     for (int i = 0; i < PYR_LAYERS; i++) {
         CalculateTemporalGradient(
-            queue, temporal_gradient_kernel, WORK_DIM, local_item_size, &frame1s[i], &frame2s[i], &It[i], width / pow(DSR, i), height / pow(DSR, i)
+            queue, temporal_gradient_kernel, WORK_DIM, local_item_size, &frame1[i], &frame2[i], &It[i], width / pow(DSR, i), height / pow(DSR, i)
         );
     }
 
+    // solve
     for (int i = 0; i < PYR_LAYERS; i++) {
-        Solver(
-            queue, stack_kernel, invert_kernel, unterleave_kernel, context, &frame1s[i], &frame1_Ix[i], &frame1_Iy[i], &It[i], &u[i], &v[i], width, height, FLOW_WINDOW 
-        );
+        int coarse_layer = PYR_LAYERS - i - 1; // 2 to 0
+        int fine_layer = PYR_LAYERS - i - 2; // 1 to -1
+        printf("Layer %i\n", coarse_layer);
+
+        for (int j = 0; j < WARPS; j++) {
+            printf("Solve %i\n", j);
+            // Estimate new Image 2
+            Warp(
+                queue, warp_kernel, context, local_item_size, &frame2[coarse_layer], &u[coarse_layer], &v[coarse_layer], &frame2_warped[coarse_layer], width / pow(DSR, coarse_layer), height / pow(DSR, coarse_layer)
+            );
+            // Recalculate new gradients
+            CalculateTemporalGradient(
+                queue, temporal_gradient_kernel, WORK_DIM, local_item_size, &frame1[coarse_layer], &frame2_warped[coarse_layer], &It[coarse_layer], width / pow(DSR, coarse_layer), height / pow(DSR, coarse_layer)
+            );/*
+            Convolve(
+                queue, convolution_kernel, WORK_DIM, local_item_size, &frame2[coarse_layer], &frame2_Ix[coarse_layer], &sobel_x, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+            );
+            Convolve(
+                queue, convolution_kernel, WORK_DIM, local_item_size, &frame2[coarse_layer], &frame2_Iy[coarse_layer], &sobel_y, width / pow(DSR, i), height / pow(DSR, i), sobel_radius, 1
+            );*/
+            // Accumulate motion vectors
+            Solver(
+                queue, stack_kernel, invert_kernel, unterleave_kernel, context, &frame1[coarse_layer], &frame1_Ix[coarse_layer], &frame1_Iy[coarse_layer], &It[coarse_layer], &u[coarse_layer], &v[coarse_layer], width / pow(DSR, coarse_layer), height / pow(DSR, coarse_layer), FLOW_WINDOW 
+            );
+            
+        }
+        
+        if(i < PYR_LAYERS - 1) {
+            printf("Upsample %i to %i\n", coarse_layer, fine_layer);
+            Upsample(
+                queue, upsample_kernel, context, local_item_size, &u[coarse_layer], &u[fine_layer], &v[coarse_layer], &v[fine_layer], width / pow(DSR, coarse_layer), width / pow(DSR, fine_layer), height / pow(DSR, coarse_layer), height / pow(DSR, fine_layer)
+            );
+        }
     }
 
     //@@ Copy the GPU memory back to the CPU here
@@ -647,19 +796,24 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
 
     err = clEnqueueReadBuffer(queue, u[0], CL_TRUE, 0, height * width * sizeof(float), result_x->data, 0, NULL, NULL);
     result_x->shape[0] = height;
+    result_x->shape[1] = width;
+    CHECK_ERR(err, "clEnqueueReadBuffer");
+
+    err = clEnqueueReadBuffer(queue, v[0], CL_TRUE, 0, height * width * sizeof(float), result_y->data, 0, NULL, NULL);
+    result_y->shape[0] = height;
     result_y->shape[1] = width;
     CHECK_ERR(err, "clEnqueueReadBuffer");
 
-    err = clEnqueueReadBuffer(queue, v[0], CL_TRUE, 0, height * width * sizeof(float), result_x->data, 0, NULL, NULL);
-    result_x->shape[0] = height;
-    result_y->shape[1] = width;
+    err = clEnqueueReadBuffer(queue, frame2_warped[0], CL_TRUE, 0, height * width * sizeof(float), result->data, 0, NULL, NULL);
+    result->shape[0] = height;
+    result->shape[1] = width;
     CHECK_ERR(err, "clEnqueueReadBuffer");
-
 
     //@@ Free the GPU memory here
     for (int i = 0; i < PYR_LAYERS; i++) {
-        clReleaseMemObject(frame1s[i]);
-        clReleaseMemObject(frame2s[i]);
+        clReleaseMemObject(frame1[i]);
+        clReleaseMemObject(frame2[i]);
+        clReleaseMemObject(frame2_warped[i]);
         clReleaseMemObject(frame1_Ix[i]);
         clReleaseMemObject(frame2_Ix[i]);
         clReleaseMemObject(frame1_Iy[i]);
@@ -695,7 +849,7 @@ int main(int argc, char *argv[])
     // host_a = input frame 1
     // host_b = input frame 2
     // host_c = output frame
-    Matrix host_a, host_b, host_c, host_d;
+    Matrix host_a, host_b, host_c, host_d, host_e;
     
     int input_width, input_height, input_channels;
 
@@ -733,30 +887,36 @@ int main(int argc, char *argv[])
     host_d.shape[1] = output_width;
     host_d.data = (float *)malloc(sizeof(float) * host_d.shape[0] * host_d.shape[1]);
 
+    host_e.shape[0] = output_height;
+    host_e.shape[1] = output_width;
+    host_e.data = (float *)malloc(sizeof(float) * host_e.shape[0] * host_e.shape[1]);
+
     // Call your optical flow.
     printf("Start optical flow...\n");
-    OpenCLOpticalFlow(&host_a, &host_b, &host_c, &host_d);
+    OpenCLOpticalFlow(&host_a, &host_b, &host_c, &host_d, &host_e);
 
     printf("Read output...\n");
+
+    // output image
     unsigned char *output_bytes = (unsigned char *)malloc(output_height * output_width);
     for (int i = 0; i < output_height * output_width; i++) {
-        output_bytes[i] = (unsigned char)(host_c.data[i] * 255);
+        output_bytes[i] = (unsigned char)(host_e.data[i] * 255);
     }
 
-    stbi_write_png(input_file_d, output_width, output_height, output_channels, output_bytes, output_width * output_channels);
+    stbi_write_png("warped_frame_2.png", host_c.shape[1], host_c.shape[0], output_channels, output_bytes, host_c.shape[1] * output_channels);
     SaveMatrix("output.raw", &host_c);
 
-    CShape shape(input_width, input_height, 2);
+    CShape shape(host_c.shape[1], host_c.shape[0], 2);
     CFloatImage img(shape);
-    for (int x = 0; x < input_width; x++) {
-        for (int y = 0; y < input_height; y++) {
-            img.Pixel(x, y, 0) = host_c.data[y * input_width + x];
-            img.Pixel(x, y, 1) = host_d.data[y * input_width + x];
+    for (int x = 0; x < host_c.shape[1]; x++) {
+        for (int y = 0; y < host_c.shape[0]; y++) {
+            img.Pixel(x, y, 0) = host_c.data[y * host_c.shape[1] + x];
+            img.Pixel(x, y, 1) = host_d.data[y * host_c.shape[1] + x];
         }
     }
     WriteFlowFile(img, "output.flo");
 
-    std::system("../../helper_lib/flow-code/color_flow output.flo outputcolors.png");
+    std::system("../../helper_lib/flow-code/color_flow output.flo output.png");
 
     // Release host memory
     free(host_a.data);
