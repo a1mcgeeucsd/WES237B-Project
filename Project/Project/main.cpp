@@ -38,6 +38,8 @@
 // Number of Pyramid Layers
 #define PYR_LAYERS 3
 
+#define FLOW_WINDOW 7
+
 const float gaussian_weights[25] = {
     0.00390625f, 0.015625f, 0.0234375f, 0.015625f, 0.00390625f,
     0.015625f,   0.0625f,   0.09375f,   0.0625f,   0.015625f, 
@@ -290,6 +292,7 @@ void Solver(
     cl_command_queue queue,
     cl_kernel stack_kernel,
     cl_kernel invert_kernel,
+    cl_kernel unterleave_kernel,
     cl_context context,
     cl_mem *image, 
     cl_mem *I_x,
@@ -435,11 +438,28 @@ void Solver(
         B, &queue
     );
 
+    err = clSetKernelArg(unterleave_kernel, 0, sizeof(cl_mem), &device_v);
+    CHECK_ERR(err, "clSetKernelArg 0");
+    err = clSetKernelArg(unterleave_kernel, 1, sizeof(cl_mem), u);
+    CHECK_ERR(err, "clSetKernelArg 1");
+    err = clSetKernelArg(unterleave_kernel, 2, sizeof(cl_mem), v);
+    CHECK_ERR(err, "clSetKernelArg 2");
+    err = clSetKernelArg(unterleave_kernel, 3, sizeof(int), &width);
+    CHECK_ERR(err, "clSetKernelArg 3");
+    err = clSetKernelArg(unterleave_kernel, 4, sizeof(int), &height);
+    CHECK_ERR(err, "clSetKernelArg 4");
+    err = clSetKernelArg(unterleave_kernel, 5, sizeof(int), &K);
+
+    size_t gws_unt[2] = {(size_t)o_width, (size_t)o_height};
+    size_t lws_unt[2] = {1, 1};
+    clEnqueueNDRangeKernel(queue, unterleave_kernel, 2, NULL, gws_unt, lws_unt, 0, NULL, NULL);
+
     clblast::ClearCache();
     clReleaseMemObject(device_A);
     clReleaseMemObject(device_b);
     clReleaseMemObject(device_ATA);
     clReleaseMemObject(device_ATA_inv_AT);
+    clReleaseMemObject(device_v);
 }
 
 void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix *result_y)
@@ -457,6 +477,7 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
     cl_kernel temporal_gradient_kernel;          // kernel
     cl_kernel stack_kernel;          // kernel
     cl_kernel invert_kernel;
+    cl_kernel unterleave_kernel;
 
     // Find platforms and devices
     OclPlatformProp *platforms = NULL;
@@ -500,6 +521,8 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
     stack_kernel = clCreateKernel(program, "constructLKVector", &err);
     CHECK_ERR(err, "clCreateKernel");
     invert_kernel = clCreateKernel(program, "inPlaceInvert2x2Matrix", &err);
+    CHECK_ERR(err, "clCreateKernel");
+    unterleave_kernel = clCreateKernel(program, "unterleave", &err);
     CHECK_ERR(err, "clCreateKernel");
 
     printf("Kernels created\n");
@@ -613,7 +636,7 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result_x, Matrix 
 
     for (int i = 0; i < PYR_LAYERS; i++) {
         Solver(
-            queue, stack_kernel, invert_kernel, context, &frame1s[i], &frame1_Ix[i], &frame1_Iy[i], &It[i], &u[i], &v[i], width, height, 7 
+            queue, stack_kernel, invert_kernel, unterleave_kernel, context, &frame1s[i], &frame1_Ix[i], &frame1_Iy[i], &It[i], &u[i], &v[i], width, height, FLOW_WINDOW 
         );
     }
 
