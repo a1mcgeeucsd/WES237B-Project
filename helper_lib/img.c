@@ -117,7 +117,7 @@ cl_int LoadImgRaw(const char *path, Image* img)
     img->shape[1] = cols;
     img->shape[2] = channels;
 
-    img->data = malloc(sizeof(int) * rows * cols * channels);
+    img->data = (int*)malloc(sizeof(int) * rows * cols * channels);
     if (!img->data){ // Error mallocing matrix data
         return CL_OUT_OF_HOST_MEMORY;
     }

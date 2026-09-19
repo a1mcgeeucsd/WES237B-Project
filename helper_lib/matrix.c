@@ -25,7 +25,7 @@ cl_int LoadMatrix(const char *path, Matrix *matrix)
     matrix->shape[0] = rows;
     matrix->shape[1] = cols;
 
-    matrix->data = malloc(sizeof(float) * rows * cols);
+    matrix->data = (float *)malloc(sizeof(float) * rows * cols);
     if (!matrix->data) // Error mallocing matrix data
         return CL_OUT_OF_HOST_MEMORY;
 

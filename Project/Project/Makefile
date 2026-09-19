@@ -8,6 +8,8 @@ ifeq ($(shell uname -o), Darwin)
 else ifeq ($(shell uname -o), GNU/Linux) # Assumes NVIDIA GPU
 	LDFLAGS  += -L/usr/local/cuda/lib64 -lOpenCL
 	INCFLAGS += -I/usr/local/cuda/include
+	INCFLAGS += -I../../helper_lib/flow-code
+	INCFLAGS += -I../../helper_lib/flow-code/imageLib
 else # Android
 	LDFLAGS += -lOpenCL
 endif

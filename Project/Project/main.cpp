@@ -1,12 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <cstdlib> 
 #include <clblast.h>
 #include <vector>
 
 #include "device.h"
 #include "kernel.h"
 #include "matrix.h"
+
+#include "flow-code/imageLib/Image.h"
+#include "flow-code/flowIO.h"
+#include "flow-code/colorcode.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -440,16 +445,6 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
     // Load external OpenCL kernel code
     char *kernel_source = OclLoadKernel("opticalFlow.cl"); // Load kernel source
 
-    // Device input and output buffers (float, 0 to 1.0f)
-    // device_a0 = frame 1 level 0 (no downsample)
-    // device_b0 = frame 2 
-    // device_a1 = frame 1 level 1 (downsampled with gaussian blur 1/2)
-    // device_b1 = frame 2 
-    // device_a2 = frame 1 level 2 (downsampled with gaussian blur 1/4)
-    // device_b2 = frame 2
-    // device_
-    // device_c = output (float, 0 to 1.0f)
-
     cl_int err;
 
     cl_device_id device_id;    // device ID
@@ -636,7 +631,6 @@ void OpenCLOpticalFlow(Matrix *input0, Matrix *input1, Matrix *result)
         clReleaseMemObject(It[i]);
     }
 
-    clReleaseMemObject(device_c);
     clReleaseProgram(program);
     clReleaseKernel(convolution_kernel);
     clReleaseKernel(temporal_gradient_kernel);
@@ -710,10 +704,17 @@ int main(int argc, char *argv[])
     stbi_write_png(input_file_d, output_width, output_height, output_channels, output_bytes, output_width * output_channels);
     SaveMatrix("output.raw", &host_c);
 
+    CShape shape(input_width, input_height, 2);
+    CFloatImage img(shape);
+    for (int x = 0; x < input_width; x++) {
+        for (int y = 0; y < input_height; y++) {
+            img.Pixel(x, y, 0) = host_c.data[y * input_width + x];
+            img.Pixel(x, y, 1) = host_c.data[y * input_width + x];
+        }
+    }
+    WriteFlowFile(img, "output.flo");
 
-
-    // Check the result of the matrix multiply
-    //CheckMatrix(&answer, &host_c);
+    std::system("../../helper_lib/flow-code/color_flow output.flo outputcolors.png");
 
     // Release host memory
     free(host_a.data);
