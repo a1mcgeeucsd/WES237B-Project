@@ -196,6 +196,40 @@ __kernel void inPlaceInvert2x2Matrix(
     ATA[batch_id * 4 + 1] = -b / det;
     ATA[batch_id * 4 + 2] = -c / det;
     ATA[batch_id * 4 + 3] = a / det;
+}
 
+__kernel void unterleave(
+    __global const float *UV,
+    __global float *u,
+    __global float *v,
+    const int width,
+    const int height,
+    const int K
+)
+{
+    int radius = K / 2;
 
+    int o_width  = width  - K + 1;
+    int o_height = height - K + 1;
+
+    int out_x = get_global_id(0);
+    int out_y = get_global_id(1);
+
+    // Only process valid convolution positions
+    if (out_x >= o_width || out_y >= o_height)
+        return;
+
+    // Map valid output position to the center pixel
+    int x = out_x + radius;
+    int y = out_y + radius;
+
+    // Row-major index in the original image
+    int image_idx = y * width + x;
+
+    // Row-major index in the valid convolution output
+    int out_idx = out_y * o_width + out_x;
+
+    // UV is interleaved: [u0, v0, u1, v1, ...]
+    u[image_idx] = UV[2 * out_idx + 0];
+    v[image_idx] = UV[2 * out_idx + 1];
 }
